@@ -137,6 +137,8 @@ class ForgejoProvider(BaseProvider):
             repo=repo,
             head_sha=(pr.get("head") or {}).get("sha") or "",
             platform="forgejo",
+            author=(pr.get("user") or {}).get("login")
+            or (pr.get("user") or {}).get("username", ""),
         )
 
     async def get_repo_permission(
@@ -508,7 +510,7 @@ class ForgejoProvider(BaseProvider):
                 if bot_identities and comment_user not in bot_identities:
                     continue
 
-                line = comment.get("new_position") or comment.get("line") or 0
+                line = comment.get("position") or comment.get("original_position") or 0
                 records.append(
                     BotThreadRecord(
                         thread_id=str(review["id"]),
@@ -555,6 +557,118 @@ class ForgejoProvider(BaseProvider):
 
         return None
 
+    async def get_review_reply_context(
+        self, pr_info: PRInfo, incoming_comment_id: int | str, bot_login: str | None = None
+    ) -> BotThreadRecord | None:
+        """The verified bot original a Forgejo reply comment answers.
+
+        Forgejo's inline-reply webhook is a plain ``issue_comment`` (only
+        id/body/user), so the reply's identity must come from the review
+        comments API: the incoming id has to exist there as a code comment.
+        Forgejo replies are created via ``CreateCodeCommentKnownReviewID``,
+        which copies the original's review id, tree path, side/line and
+        commits onto the reply — so the original is the earlier bot comment
+        at exactly that anchor. Anything but exactly one such candidate is
+        a guess and yields ``None`` (never: nearest, latest, or human).
+        """
+        target = str(incoming_comment_id)
+        bot_identities = {n for n in (await self._self_username(), bot_login) if n}
+        if not bot_identities:
+            logger.warning(
+                "Cannot verify bot identity for reply context on %s; refusing to trust a root",
+                pr_info.url,
+            )
+            return None
+        try:
+            async for review, comment in self._iter_review_comments(pr_info):
+                if str(comment.get("id")) != target:
+                    continue
+                return await self._find_bot_original(pr_info, review, comment, bot_identities)
+        except Exception as exc:
+            logger.warning(
+                "Failed to resolve Forgejo reply context for comment %s on %s: %s",
+                target,
+                pr_info.url,
+                exc,
+            )
+            return None
+        logger.info(
+            "Forgejo comment %s not found among %s review comments; no reply context",
+            target,
+            pr_info.url,
+        )
+        return None
+
+    async def _find_bot_original(
+        self,
+        pr_info: PRInfo,
+        review: dict[str, Any],
+        reply: dict[str, Any],
+        bot_identities: set[str],
+    ) -> BotThreadRecord | None:
+        """The unique earlier bot comment at the reply's exact anchor, or None.
+
+        Anchor = same review id, same path, same position side (``position``
+        for new-side, ``original_position`` for old-side — a comment whose
+        non-zero line is on the other side never matches), and same
+        ``commit_id``/``original_commit_id``. Zero or multiple candidates
+        return ``None``; identity is never guessed.
+        """
+        try:
+            reply_id = int(reply.get("id") or 0)
+            reply_new = int(reply.get("position") or 0)
+            reply_old = int(reply.get("original_position") or 0)
+        except (TypeError, ValueError):
+            return None
+        if not reply_new and not reply_old:
+            # No coordinates at all — any match would be a guess.
+            return None
+        review_id = str(review.get("id"))
+        candidates: list[tuple[dict[str, Any], dict[str, Any]]] = []
+
+        async for r, c in self._iter_review_comments(pr_info):
+            if str(r.get("id")) != review_id:
+                continue
+            try:
+                cid = int(c.get("id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if cid >= reply_id:
+                continue  # must be an *earlier* comment (the original, not the reply)
+            if (c.get("path") or "") != (reply.get("path") or ""):
+                continue
+            if reply_new:
+                if int(c.get("position") or 0) != reply_new:
+                    continue
+            else:
+                if int(c.get("original_position") or 0) != reply_old:
+                    continue
+            if (c.get("commit_id") or "") != (reply.get("commit_id") or ""):
+                continue
+            if (c.get("original_commit_id") or "") != (reply.get("original_commit_id") or ""):
+                continue
+            if (c.get("user") or {}).get("username", "") not in bot_identities:
+                continue
+            candidates.append((r, c))
+
+        if len(candidates) != 1:
+            logger.info(
+                "Forgejo reply %s on %s matched %d bot original(s); requiring exactly 1",
+                reply.get("id"),
+                pr_info.url,
+                len(candidates),
+            )
+            return None
+        original_review, original = candidates[0]
+        return BotThreadRecord(
+            thread_id=str(original_review.get("id")),
+            path=original.get("path") or "",
+            line=int(original.get("position") or original.get("original_position") or 0),
+            body=original.get("body") or "",
+            is_resolved=bool(original.get("resolver")),
+            is_outdated=bool(original_review.get("stale")),
+        )
+
     async def get_human_review_comments(
         self, pr_info: PRInfo, bot_login: str
     ) -> list[HumanReviewComment]:
@@ -571,7 +685,7 @@ class ForgejoProvider(BaseProvider):
                 if comment_user in bot_identities:
                     continue
 
-                line = comment.get("new_position") or comment.get("line") or 0
+                line = comment.get("position") or comment.get("original_position") or 0
                 out.append(
                     HumanReviewComment(
                         path=comment.get("path") or "",
