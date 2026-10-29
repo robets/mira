@@ -196,6 +196,7 @@ async def handle_gitlab_note(payload: dict[str, Any], auth: PlatformAuth, bot_na
         _RESUME_KEYWORDS,
         PAUSE_LABEL,
         _open_store,
+        _record_rejected_feedback,
         run_pr_command,
         run_thread_reply,
     )
@@ -255,11 +256,28 @@ async def handle_gitlab_note(payload: dict[str, Any], auth: PlatformAuth, bot_na
             await provider.post_comment(pr_info, "Automatic reviews resumed.")
             return
 
+        # Thread identity comes from the provider seam: the discussion that
+        # actually contains this note, whose root must be verified
+        # bot-authored. Payload position is only ever a display fallback —
+        # never the learning source.
         discussion_id = attrs.get("discussion_id")
         position = attrs.get("position")
+        try:
+            context = await provider.get_review_reply_context(pr_info, attrs.get("id"))
+        except Exception as ctx_err:
+            logger.warning(
+                "Failed to resolve GitLab reply context for note %s on %s: %s",
+                attrs.get("id"),
+                mr_url,
+                ctx_err,
+            )
+            context = None
 
-        # Explicit reject on an inline (diff) note → resolve + record feedback.
-        if first_word in _REJECT_KEYWORDS and discussion_id and position:
+        # Explicit reject on a thread with a verified bot original → resolve
+        # the thread and record feedback derived from that original. An
+        # unverifiable reject never reaches the paid Q&A path and never
+        # records a bogus empty-metadata event.
+        if first_word in _REJECT_KEYWORDS:
             if not await is_command_allowed(
                 config,
                 "reject",
@@ -270,39 +288,72 @@ async def handle_gitlab_note(payload: dict[str, Any], auth: PlatformAuth, bot_na
                 user_id=actor_id,
             ):
                 return
-            await provider.resolve_threads(pr_info, [str(discussion_id)])
+            if context is None:
+                logger.info(
+                    "GitLab reject on note %s (%s) has no verified bot original; recording nothing",
+                    attrs.get("id"),
+                    mr_url,
+                )
+                return
+            try:
+                await provider.resolve_threads(pr_info, [context.thread_id])
+            except Exception as resolve_err:
+                logger.warning(
+                    "Failed to resolve GitLab discussion %s on %s: %s",
+                    context.thread_id,
+                    mr_url,
+                    resolve_err,
+                )
+                # Fall through: the authorized reject intent is still learned.
             try:
                 store = _open_store(owner, repo, "gitlab")
-                store.record_feedback(
-                    pr_number=iid,
-                    pr_url=mr_url,
-                    comment_path=position.get("new_path", ""),
-                    comment_line=position.get("new_line", 0) or 0,
-                    comment_category="",
-                    comment_severity="",
-                    comment_title="",
-                    signal="rejected",
-                    actor=actor,
-                )
+                try:
+                    _record_rejected_feedback(
+                        store,
+                        pr_number=iid,
+                        pr_url=mr_url,
+                        original_body=context.body,
+                        comment_path=context.path,
+                        comment_line=context.line,
+                        actor=actor,
+                        pr_author=getattr(pr_info, "author", "") or "",
+                    )
+                finally:
+                    store.close()
             except Exception as exc:
                 logger.debug("Failed to record GitLab reject feedback: %s", exc)
-            finally:
-                if "store" in locals():
-                    store.close()
             return
 
         # Free-form @-mention on an inline thread → LLM intent classification.
+        # The classifier sees the *verified bot original's* body; an
+        # unverified (human-root) discussion still gets a reply but with no
+        # trusted original, so no learning signal can be derived from it.
+        if context is not None:
+            original = context.body
+            reply_thread_id: str | None = context.thread_id
+            comment_path = context.path
+            comment_line = context.line
+        elif discussion_id and position:
+            original = ""
+            reply_thread_id = str(discussion_id)
+            comment_path = position.get("new_path", "")
+            comment_line = position.get("new_line", 0) or 0
+        else:
+            original = ""
+            reply_thread_id = None
+            comment_path = ""
+            comment_line = 0
+
         if discussion_id and position:
-            original = await provider.get_discussion_root_body(pr_info, str(discussion_id))
             await run_thread_reply(
                 provider,
                 pr_info,
                 question,
                 attrs.get("id"),
                 original_suggestion=original,
-                thread_id=str(discussion_id),
-                comment_path=position.get("new_path", ""),
-                comment_line=position.get("new_line", 0) or 0,
+                thread_id=reply_thread_id,
+                comment_path=comment_path,
+                comment_line=comment_line,
                 actor=actor,
                 bot_name=bot_name,
                 platform="gitlab",

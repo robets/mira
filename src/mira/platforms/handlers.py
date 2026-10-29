@@ -75,6 +75,68 @@ def _open_store(owner: str, repo: str, platform: str = "github") -> IndexStore:
     return IndexStore.open(owner, repo, platform=platform)
 
 
+def _record_rejected_feedback(
+    store: IndexStore,
+    *,
+    pr_number: int,
+    pr_url: str,
+    original_body: str,
+    comment_path: str,
+    comment_line: int,
+    actor: str,
+    pr_author: str = "",
+) -> bool:
+    """Record rejection metadata from an original verified by the provider.
+
+    Skip unparseable findings and sequential duplicates within the last
+    2,000 events. Concurrent duplicate inserts still require store-level
+    uniqueness; this check does not provide it.
+    """
+    from mira.providers.formatting import parse_bot_comment_metadata
+
+    meta = parse_bot_comment_metadata(original_body or "")
+    if not meta["category"]:
+        logger.debug(
+            "Skipping rejected-feedback event for %s:%d — original body has no parseable metadata",
+            comment_path,
+            comment_line,
+        )
+        return False
+    existing = store.list_feedback(limit=2000)
+    if any(
+        e.signal == "rejected"
+        and e.pr_number == pr_number
+        and e.actor == actor
+        and e.comment_path == comment_path
+        and e.comment_line == comment_line
+        and e.comment_category == meta["category"]
+        and e.comment_severity == meta["severity"]
+        and e.comment_title == meta["title"]
+        for e in existing
+    ):
+        logger.info(
+            "Skipping duplicate rejected feedback from %s on %s:%d (PR #%d) — replay dedupe",
+            actor,
+            comment_path,
+            comment_line,
+            pr_number,
+        )
+        return False
+    store.record_feedback(
+        pr_number=pr_number,
+        pr_url=pr_url,
+        comment_path=comment_path,
+        comment_line=comment_line,
+        comment_category=meta["category"],
+        comment_severity=meta["severity"],
+        comment_title=meta["title"],
+        signal="rejected",
+        actor=actor,
+        pr_author=pr_author,
+    )
+    return True
+
+
 def _help_message(bot_name: str) -> str:
     """Markdown help comment listing every command Mira understands."""
     return (
@@ -390,16 +452,19 @@ async def run_thread_reply(
         try:
             store = _open_store(pr_info.owner, pr_info.repo, platform)
             try:
-                store.record_feedback(
+                # ``original_suggestion`` here must be the verified bot
+                # original's body (callers source it from
+                # ``get_review_reply_context``); the helper records nothing
+                # for an untrusted/unparseable original.
+                _record_rejected_feedback(
+                    store,
                     pr_number=pr_info.number,
                     pr_url=pr_info.url,
+                    original_body=original_suggestion,
                     comment_path=comment_path,
                     comment_line=comment_line,
-                    comment_category="",
-                    comment_severity="",
-                    comment_title="",
-                    signal="rejected",
                     actor=actor,
+                    pr_author=getattr(pr_info, "author", "") or "",
                 )
             finally:
                 store.close()

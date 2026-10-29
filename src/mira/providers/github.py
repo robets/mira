@@ -115,6 +115,7 @@ mutation($threadId: ID!) {
 
 _COMMENT_THREAD_QUERY = """
 query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+  viewer { login }
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
       reviewThreads(first: 50, after: $cursor) {
@@ -122,8 +123,17 @@ query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
         nodes {
           id
           isResolved
+          isOutdated
           comments(first: 100) {
-            nodes { id }
+            nodes {
+              id
+              databaseId
+              author { login }
+              body
+              path
+              line
+              originalLine
+            }
           }
         }
       }
@@ -1192,6 +1202,89 @@ class GitHubProvider(BaseProvider):
                     "hasNextPage=True but endCursor is None for comment %s; stopping pagination",
                     comment_node_id,
                 )
+                return None
+
+    async def get_review_reply_context(
+        self, pr_info: PRInfo, incoming_comment_id: int | str, bot_login: str | None = None
+    ) -> BotThreadRecord | None:
+        """The verified bot-authored root of the thread the reply answers.
+
+        Paginates the same (augmented) ``reviewThreads`` connection as
+        :meth:`get_thread_id_for_comment`, matches the incoming comment by
+        GraphQL node id or numeric ``databaseId``, and returns the *first*
+        comment's record — not the reply's. Resolution state is included
+        (an already-resolved thread still yields its record so a late reject
+        can record learning intent); a non-bot root or a miss yields None.
+        """
+        target = str(incoming_comment_id)
+        viewer_login: str | None = None
+        cursor: str | None = None
+
+        while True:
+            try:
+                data = await self._graphql_request(
+                    _COMMENT_THREAD_QUERY,
+                    {
+                        "owner": pr_info.owner,
+                        "repo": pr_info.repo,
+                        "number": pr_info.number,
+                        "cursor": cursor,
+                    },
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to resolve reply context for comment %s on PR %s: %s",
+                    target,
+                    pr_info.url,
+                    exc,
+                )
+                return None
+
+            if viewer_login is None:
+                viewer_login = (data.get("viewer") or {}).get("login")
+            effective_login = bot_login or viewer_login or ""
+
+            pr_data = (data.get("repository") or {}).get("pullRequest") or {}
+            connection = pr_data.get("reviewThreads") or {
+                "nodes": [],
+                "pageInfo": {"hasNextPage": False},
+            }
+            for thread in connection.get("nodes") or []:
+                comments = (thread.get("comments") or {}).get("nodes") or []
+                matched = any(
+                    c.get("id") == target
+                    or (c.get("databaseId") is not None and str(c.get("databaseId")) == target)
+                    for c in comments
+                )
+                if not matched:
+                    continue
+                root = comments[0]
+                root_login = (root.get("author") or {}).get("login", "")
+                if not effective_login or not root_login:
+                    return None
+                if _normalize_login(root_login) != _normalize_login(effective_login):
+                    logger.info(
+                        "Reply %s on PR %s answers a non-bot thread (root author %r); "
+                        "not treating it as a learning signal",
+                        target,
+                        pr_info.url,
+                        root_login,
+                    )
+                    return None
+                return BotThreadRecord(
+                    thread_id=thread["id"],
+                    path=root.get("path") or "",
+                    line=root.get("line") or root.get("originalLine") or 0,
+                    body=root.get("body") or "",
+                    is_resolved=bool(thread.get("isResolved")),
+                    is_outdated=bool(thread.get("isOutdated")),
+                )
+
+            page = connection.get("pageInfo", {})
+            if not page.get("hasNextPage"):
+                return None
+            cursor = page.get("endCursor")
+            if cursor is None:
                 return None
 
     async def get_all_bot_threads(
