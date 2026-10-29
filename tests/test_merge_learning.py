@@ -591,3 +591,203 @@ async def test_handle_pr_merged_end_to_end(tmp_path, monkeypatch):
     fake_llm.complete.assert_not_called()
 
     store.close()
+
+
+# ── Forgejo merge end-to-end ──
+
+
+@pytest.mark.asyncio
+async def test_handle_forgejo_merge_end_to_end(tmp_path, monkeypatch):
+    """The Forgejo merge handler drives the real shared learning path with
+    platform='forgejo', correct merge identity, and dedup on repeat delivery."""
+    from mira.models import PRInfo
+    from mira.platforms.forgejo import webhook as fj
+
+    store = IndexStore(str(tmp_path / "fj.db"))
+
+    # Seed a prior rejected event — the corresponding bot thread must NOT be
+    # re-recorded as accepted on merge.
+    store.record_feedback(
+        pr_number=7,
+        pr_url="https://forgejo.example/o/r/pulls/7",
+        comment_path="src/db.py",
+        comment_line=20,
+        comment_category="",
+        comment_severity="",
+        comment_title="",
+        signal="rejected",
+        actor="alice",
+    )
+
+    opened: list[tuple] = []
+
+    def fake_open_store(owner, repo, platform="github"):
+        opened.append((owner, repo, platform))
+        return _StoreProxy(store)
+
+    monkeypatch.setattr("mira.platforms.handlers._open_store", fake_open_store)
+
+    pr_info = PRInfo(
+        title="Add feature",
+        description="",
+        base_branch="main",
+        head_branch="f",
+        url="https://forgejo.example/o/r/pulls/7",
+        number=7,
+        owner="o",
+        repo="r",
+        platform="forgejo",
+        author="dave",
+    )
+    mock_provider = MagicMock()
+    mock_provider.get_pr_info = AsyncMock(return_value=pr_info)
+    mock_provider.get_all_bot_threads = AsyncMock(
+        return_value=[
+            BotThreadRecord(
+                thread_id="t1",
+                path="src/auth.py",
+                line=10,
+                body=(
+                    "🐛 **Bug**\n"
+                    "🛑 Blocker — must fix before merge\n"
+                    "\n"
+                    "**Null handling missing**\n"
+                    "\n"
+                    "The function crashes on empty input.\n"
+                ),
+                is_resolved=False,
+            ),
+            # At the rejected location — should be skipped.
+            BotThreadRecord(
+                thread_id="t2",
+                path="src/db.py",
+                line=20,
+                body="🔒 **Security issue**\n⚠️ Warning\n\n**Raw SQL**\n\nbody",
+                is_resolved=True,
+            ),
+            BotThreadRecord(
+                thread_id="t3",
+                path="src/utils.py",
+                line=5,
+                body="⚡ **Performance**\n\n**Slow loop**\n\nbody",
+                is_resolved=False,
+            ),
+            # Malformed body — should be skipped (no parseable category).
+            BotThreadRecord(
+                thread_id="t4",
+                path="src/other.py",
+                line=1,
+                body="not a structured comment",
+                is_resolved=False,
+            ),
+        ]
+    )
+    mock_provider.get_human_review_comments = AsyncMock(
+        return_value=[
+            HumanReviewComment(
+                path="src/auth.py",
+                line=10,
+                body="Please avoid raw SQL here — use the query builder.",
+                author="reviewer1",
+            ),
+            HumanReviewComment(
+                path="src/api.py",
+                line=5,
+                body="Let's add proper error handling to this request path.",
+                author="reviewer2",
+            ),
+            # Empty body — should be skipped.
+            HumanReviewComment(path="x.py", line=1, body="   ", author="reviewer3"),
+        ]
+    )
+
+    monkeypatch.setattr(fj, "create_provider", lambda *a, **kw: mock_provider)
+
+    auth = MagicMock()
+    auth.get_token = AsyncMock(return_value="tok")
+
+    fake_config = MagicMock()
+    fake_config.llm = MagicMock()
+    monkeypatch.setattr("mira.platforms.handlers.load_config", lambda: fake_config)
+
+    # Bypass the dashboard DB lookup in llm_config_for.
+    import mira.dashboard.models_config as mc
+
+    monkeypatch.setattr(mc, "llm_config_for", lambda purpose, base: base)
+
+    fake_llm = MagicMock()
+    fake_llm.complete = AsyncMock(
+        return_value=json.dumps(
+            {
+                "rules": [
+                    {
+                        "rule": "Avoid raw SQL queries outside the data-access layer.",
+                        "rationale": "Reviewers consistently push back on them.",
+                        "evidence_count": 2,
+                    },
+                ]
+            }
+        )
+    )
+    monkeypatch.setattr("mira.platforms.handlers.create_llm", lambda *a, **kw: fake_llm)
+
+    payload = {
+        "action": "closed",
+        "pull_request": {
+            "number": 7,
+            "merged": True,
+            "merged_by": {"login": "carol"},
+            "html_url": "https://forgejo.example/o/r/pulls/7",
+        },
+        "repository": {"full_name": "o/r", "html_url": "https://forgejo.example/o/r"},
+        "sender": {"login": "alice"},
+    }
+
+    await fj.handle_forgejo_merge(payload, auth, "mira")
+
+    # The shared learning path opened the store scoped to forgejo.
+    assert opened and opened[0] == ("o", "r", "forgejo")
+
+    events = store.list_feedback(limit=100)
+    by_signal: dict[str, list] = {"accepted": [], "human_review": [], "rejected": []}
+    for e in events:
+        by_signal.setdefault(e.signal, []).append(e)
+
+    # Bot threads: t1 + t3 accepted; t2 skipped (prior reject); t4 skipped
+    # (no parseable metadata).
+    assert len(by_signal["accepted"]) == 2
+    assert {e.comment_path for e in by_signal["accepted"]} == {"src/auth.py", "src/utils.py"}
+    assert {e.comment_category for e in by_signal["accepted"]} == {"bug", "performance"}
+    # Attribution: the merger is the actor on accepted events, PR author carried.
+    assert all(e.actor == "carol" for e in by_signal["accepted"])
+    assert all(e.pr_author == "dave" for e in by_signal["accepted"])
+
+    # Two human-review events (third had empty body).
+    assert len(by_signal["human_review"]) == 2
+    assert {e.comment_path for e in by_signal["human_review"]} == {"src/auth.py", "src/api.py"}
+
+    # Original rejected event still present and not duplicated.
+    assert len(by_signal["rejected"]) == 1
+
+    # No reviewer stats — only accept/reject/human-review signals are recorded.
+    assert {e.signal for e in events} == {"accepted", "human_review", "rejected"}
+
+    fake_llm.complete.assert_called_once()
+    rules = store.list_learned_rules()
+    human_rules = [r for r in rules if r.source_signal == "human_pattern"]
+    assert len(human_rules) == 1
+    assert "raw sql" in human_rules[0].rule_text.lower()
+
+    # ── Repeat delivery (webhook retry) must not duplicate ──
+    fake_llm.complete.reset_mock()
+    mock_provider.get_all_bot_threads.reset_mock()
+    mock_provider.get_human_review_comments.reset_mock()
+
+    await fj.handle_forgejo_merge(payload, auth, "mira")
+
+    assert len(store.list_feedback(limit=100)) == len(events)
+    mock_provider.get_all_bot_threads.assert_not_called()
+    mock_provider.get_human_review_comments.assert_not_called()
+    fake_llm.complete.assert_not_called()
+
+    store.close()

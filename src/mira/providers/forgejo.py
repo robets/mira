@@ -524,7 +524,7 @@ class ForgejoProvider(BaseProvider):
                 if bot_identities and comment_user not in bot_identities:
                     continue
 
-                line = comment.get("new_position") or comment.get("line") or 0
+                line = comment.get("position") or comment.get("original_position") or 0
                 records.append(
                     BotThreadRecord(
                         thread_id=str(review["id"]),
@@ -587,7 +587,7 @@ class ForgejoProvider(BaseProvider):
                 if comment_user in bot_identities:
                     continue
 
-                line = comment.get("new_position") or comment.get("line") or 0
+                line = comment.get("position") or comment.get("original_position") or 0
                 out.append(
                     HumanReviewComment(
                         path=comment.get("path") or "",
