@@ -274,6 +274,7 @@ async def handle_forgejo_note(payload: dict[str, Any], auth: PlatformAuth, bot_n
         _RESUME_KEYWORDS,
         PAUSE_LABEL,
         _open_store,
+        _record_rejected_feedback,
         run_pr_command,
         run_thread_reply,
     )
@@ -351,15 +352,29 @@ async def handle_forgejo_note(payload: dict[str, Any], auth: PlatformAuth, bot_n
             await provider.post_comment(pr_info, "Automatic reviews resumed.")
             return
 
-        # Forgejo inline review comments carry path/line on the comment itself
-        comment_path = comment.get("path", "")
-        comment_line = comment.get("line", 0) or 0
+        # Forgejo's inline-reply webhook is a plain ``issue_comment`` (see
+        # services/webhook/notifier.go: CreateIssueComment serialises
+        # api.Comment) — it carries NO path, line, or parent, even though the
+        # comment answers a review finding. Thread identity therefore comes
+        # from the review-comments API via the provider seam, never from the
+        # payload. Non-inline PR comments resolve to ``None`` and keep the
+        # general command/Q&A UX.
+        try:
+            context = await provider.get_review_reply_context(pr_info, comment.get("id"))
+        except Exception as ctx_err:
+            logger.warning(
+                "Failed to resolve Forgejo reply context for comment %s on %s: %s",
+                comment.get("id"),
+                pr_url,
+                ctx_err,
+            )
+            context = None
 
-        # Forgejo has no discussion threading, so thread_id is the comment id
-        thread_id = str(comment.get("id", ""))
-
-        # Explicit reject on an inline (diff) comment → record feedback.
-        if first_word in _REJECT_KEYWORDS and comment_path:
+        # Explicit reject on a verified bot thread → record feedback from the
+        # verified original. An unverifiable reject is never answered through
+        # the paid Q&A path and never recorded as a bogus empty-metadata
+        # event — it is simply ignored (the finding stays open).
+        if first_word in _REJECT_KEYWORDS:
             if not await is_command_allowed(
                 config,
                 "reject",
@@ -370,38 +385,46 @@ async def handle_forgejo_note(payload: dict[str, Any], auth: PlatformAuth, bot_n
                 user_id=actor_id,
             ):
                 return
+            if context is None:
+                logger.info(
+                    "Forgejo reject on comment %s (%s) has no verified bot original; "
+                    "recording nothing",
+                    comment.get("id"),
+                    pr_url,
+                )
+                return
             try:
                 store = _open_store(owner, repo_name, "forgejo")
-                store.record_feedback(
-                    pr_number=number,
-                    pr_url=pr_url,
-                    comment_path=comment_path,
-                    comment_line=comment_line,
-                    comment_category="",
-                    comment_severity="",
-                    comment_title="",
-                    signal="rejected",
-                    actor=actor,
-                )
+                try:
+                    _record_rejected_feedback(
+                        store,
+                        pr_number=number,
+                        pr_url=pr_url,
+                        original_body=context.body,
+                        comment_path=context.path,
+                        comment_line=context.line,
+                        actor=actor,
+                        pr_author=getattr(pr_info, "author", "") or "",
+                    )
+                finally:
+                    store.close()
             except Exception as exc:
                 logger.debug("Failed to record Forgejo reject feedback: %s", exc)
-            finally:
-                if "store" in locals():
-                    store.close()
             return
 
-        # Free-form @-mention on an inline comment → LLM intent classification.
-        if comment_path:
-            original = await provider.get_comment_body(pr_info, int(thread_id))
+        # Free-form @-mention on a verified inline thread → LLM intent
+        # classification against the *verified bot original's* body, never
+        # the incoming human reply or payload coordinates.
+        if context is not None:
             await run_thread_reply(
                 provider,
                 pr_info,
                 question,
                 comment.get("id"),
-                original_suggestion=original,
-                thread_id=thread_id,
-                comment_path=comment_path,
-                comment_line=comment_line,
+                original_suggestion=context.body,
+                thread_id=context.thread_id,
+                comment_path=context.path,
+                comment_line=context.line,
                 actor=actor,
                 bot_name=bot_name,
                 platform="forgejo",

@@ -457,11 +457,12 @@ def _make_review_comment_payload(body: str, node_id: str = "MDI0Ol_abc") -> dict
         "installation": {"id": 1},
         "action": "created",
         "comment": {
+            "id": 305,
             "body": body,
             "node_id": node_id,
             "user": {"login": "alice"},
         },
-        "pull_request": {"number": 42},
+        "pull_request": {"number": 42, "user": {"login": "carol"}},
         "repository": {
             "owner": {"login": "testowner"},
             "name": "testrepo",
@@ -480,6 +481,7 @@ async def test_handle_thread_reject_resolves_for_each_keyword(
     mock_provider = AsyncMock()
     mock_provider.get_repo_permission = AsyncMock(return_value="write")
     mock_provider.get_thread_id_for_comment = AsyncMock(return_value="PRRT_123")
+    mock_provider.get_review_reply_context = AsyncMock(return_value=None)
     mock_provider.resolve_threads = AsyncMock(return_value=1)
     mock_provider_cls.return_value = mock_provider
 
@@ -519,6 +521,7 @@ async def test_handle_thread_reject_thread_not_found(
     mock_provider = AsyncMock()
     mock_provider.get_repo_permission = AsyncMock(return_value="write")
     mock_provider.get_thread_id_for_comment = AsyncMock(return_value=None)
+    mock_provider.get_review_reply_context = AsyncMock(return_value=None)
     mock_provider_cls.return_value = mock_provider
 
     payload = _make_review_comment_payload("@mira-bot reject")
@@ -538,6 +541,7 @@ async def test_handle_thread_reject_resolve_failure_posts_reply(
     mock_provider = AsyncMock()
     mock_provider.get_repo_permission = AsyncMock(return_value="write")
     mock_provider.get_thread_id_for_comment = AsyncMock(return_value="PRRT_123")
+    mock_provider.get_review_reply_context = AsyncMock(return_value=None)
     mock_provider.resolve_threads = AsyncMock(side_effect=RuntimeError("network down"))
     mock_provider.post_comment = AsyncMock()
     mock_provider_cls.return_value = mock_provider
@@ -560,6 +564,7 @@ async def test_handle_thread_reject_exception_logged_not_raised(
 ) -> None:
     """Exceptions in reject handler are logged, not propagated."""
     mock_provider_cls.return_value.get_repo_permission = AsyncMock(return_value="write")
+    mock_provider_cls.return_value.get_review_reply_context = AsyncMock(return_value=None)
     mock_provider_cls.return_value.get_thread_id_for_comment = AsyncMock(
         side_effect=RuntimeError("boom")
     )
@@ -700,7 +705,9 @@ async def _run_disagreement_reply(config: MiraConfig):
         return_value='{"intent": "disagreement", "reply": "Understood."}'
     )
     store = MagicMock()
-    pr_info = MagicMock(owner="testowner", repo="testrepo", number=42, url="u")
+    # The dedupe check in _record_rejected_feedback reads existing events.
+    store.list_feedback = MagicMock(return_value=[])
+    pr_info = MagicMock(owner="testowner", repo="testrepo", number=42, url="u", author="carol")
     with (
         patch("mira.platforms.handlers.load_config", return_value=config),
         patch("mira.platforms.handlers.create_llm", return_value=llm),
@@ -712,6 +719,12 @@ async def _run_disagreement_reply(config: MiraConfig):
             pr_info,
             "I disagree",
             1,
+            # A verified bot original: the learning signal is parsed from this
+            # body, so an unparseable one must record nothing (see metadata test
+            # in tests/test_rejection_feedback.py).
+            original_suggestion=(
+                "**Bug**  \n🛑 Blocker — must fix before merge\n\n**Null deref**\n\nbody"
+            ),
             thread_id="T1",
             actor="alice",
         )

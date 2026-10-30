@@ -168,6 +168,29 @@ class BaseProvider(abc.ABC):
         """All bot-authored review threads (resolved and unresolved)."""
         return []
 
+    async def get_review_reply_context(
+        self, pr_info: PRInfo, incoming_comment_id: int | str, bot_login: str | None = None
+    ) -> BotThreadRecord | None:
+        """The verified bot-authored *original* a reply comment is answering.
+
+        Given the id of an incoming reply (a human's response to an inline
+        review comment), return the record of the thread's root comment —
+        body, path, line, thread id, resolution state — but only when that
+        root is verifiably authored by the bot. Each provider owns how the
+        identity is found (GitHub: thread membership via GraphQL; GitLab:
+        discussion membership; Forgejo: the reply comment's exact
+        review/path/position-side/commit anchor).
+
+        Returns ``None`` — meaning "no trusted finding" — when the reply
+        cannot be located, the root is human-authored, the bot's identity
+        cannot be resolved, or the original is ambiguous (never guessed).
+        Callers must treat the returned body/path/line as the only sound
+        learning source for this reply; the incoming human comment's own
+        body and coordinates are not evidence of what finding is being
+        rejected.
+        """
+        return None
+
     async def get_human_review_comments(
         self, pr_info: PRInfo, bot_login: str
     ) -> list[HumanReviewComment]:

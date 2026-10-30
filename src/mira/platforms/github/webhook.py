@@ -28,6 +28,7 @@ from mira.platforms.handlers import (
     _RESUME_KEYWORDS,
     PAUSE_LABEL,
     _open_store,
+    _record_rejected_feedback,
     run_pr_command,
     run_pr_merged_learning,
     run_pr_review,
@@ -387,7 +388,6 @@ async def _handle_thread_freeform_reply(
 
         comment = payload["comment"]
         comment_id: int = comment["id"]
-        in_reply_to_id: int | None = comment.get("in_reply_to_id")
 
         owner = payload["repository"]["owner"]["login"]
         repo = payload["repository"]["name"]
@@ -409,19 +409,33 @@ async def _handle_thread_freeform_reply(
 
         names = mention_names(bot_name, await app_auth.get_bot_identity())
         user_reply = strip_mentions(comment["body"], names)
-        original_suggestion = (
-            await provider.get_comment_body(pr_info, in_reply_to_id) if in_reply_to_id else ""
-        )
+
+        # The classifier and the learning signal read the *verified bot
+        # original* — never the webhook's in_reply_to parent (which can be
+        # another human's reply) and never the incoming comment's coords.
+        try:
+            context = await provider.get_review_reply_context(pr_info, comment_id)
+        except Exception as ctx_err:
+            logger.warning(
+                "Failed to resolve reply context for comment %s on PR %s/%s#%d: %s",
+                comment_id,
+                owner,
+                repo,
+                number,
+                ctx_err,
+            )
+            context = None
 
         await run_thread_reply(
             provider,
             pr_info,
             user_reply,
             comment_id,
-            original_suggestion=original_suggestion,
+            original_suggestion=context.body if context else "",
+            thread_id=context.thread_id if context else None,
             comment_node_id=comment["node_id"],
-            comment_path=comment.get("path", ""),
-            comment_line=comment.get("original_line", 0) or comment.get("line", 0),
+            comment_path=context.path if context else "",
+            comment_line=context.line if context else 0,
             actor=comment["user"]["login"],
             bot_name=bot_name,
             user_id=comment["user"].get("id"),
@@ -710,32 +724,6 @@ async def handle_thread_reject(
             payload["comment"],
         )
 
-        from mira.models import PRInfo as _PRInfo
-
-        _pr_info_for_lookup = _PRInfo(
-            title="",
-            description="",
-            base_branch="",
-            head_branch="",
-            url=f"https://github.com/{owner}/{repo}/pull/{number}",
-            number=number,
-            owner=owner,
-            repo=repo,
-        )
-        thread_id = await provider.get_thread_id_for_comment(
-            comment_node_id,
-            _pr_info_for_lookup,
-        )
-        if not thread_id:
-            logger.info(
-                "Thread not found or already resolved for comment %s on PR %s/%s#%d",
-                comment_node_id,
-                owner,
-                repo,
-                number,
-            )
-            return
-
         from mira.models import PRInfo
 
         pr_info = PRInfo(
@@ -748,58 +736,93 @@ async def handle_thread_reject(
             owner=owner,
             repo=repo,
         )
+
+        # Resolve first, learn second — each from its own source of truth.
+        # ``get_thread_id_for_comment`` keeps its exact behaviour (None for
+        # missing/already-resolved → no resolve attempt), while the learning
+        # metadata comes only from the verified bot-authored thread root via
+        # the provider seam. An already-resolved thread still yields a
+        # context record, so the authorized reject intent is recorded even
+        # when there is nothing left to resolve (or resolving fails).
+        thread_id = await provider.get_thread_id_for_comment(comment_node_id, pr_info)
         try:
-            resolved = await provider.resolve_threads(pr_info, [thread_id])
-        except Exception as resolve_err:
+            context = await provider.get_review_reply_context(pr_info, payload["comment"].get("id"))
+        except Exception as ctx_err:
             logger.warning(
-                "Failed to resolve thread %s on PR %s/%s#%d: %s",
-                thread_id,
+                "Failed to resolve reply context for comment %s on PR %s/%s#%d: %s",
+                comment_node_id,
                 owner,
                 repo,
                 number,
-                resolve_err,
+                ctx_err,
             )
+            context = None
+
+        if thread_id:
             try:
-                await provider.post_comment(
-                    pr_info,
-                    "Sorry, I couldn't dismiss this suggestion. "
-                    "Please try again or resolve the thread manually.",
-                )
-            except Exception:
+                resolved = await provider.resolve_threads(pr_info, [thread_id])
+            except Exception as resolve_err:
                 logger.warning(
-                    "Failed to post reject failure reply on PR %s/%s#%d", owner, repo, number
+                    "Failed to resolve thread %s on PR %s/%s#%d: %s",
+                    thread_id,
+                    owner,
+                    repo,
+                    number,
+                    resolve_err,
                 )
-            return
+                try:
+                    await provider.post_comment(
+                        pr_info,
+                        "Sorry, I couldn't dismiss this suggestion. "
+                        "Please try again or resolve the thread manually.",
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to post reject failure reply on PR %s/%s#%d", owner, repo, number
+                    )
+                # Fall through: the authorized reject intent is still learned.
+            else:
+                logger.info(
+                    "Reject command '%s': resolved %d thread(s) on PR %s/%s#%d",
+                    command,
+                    resolved,
+                    owner,
+                    repo,
+                    number,
+                )
+        else:
+            logger.info(
+                "Thread not found or already resolved for comment %s on PR %s/%s#%d "
+                "(recording intent if a verified bot original exists)",
+                comment_node_id,
+                owner,
+                repo,
+                number,
+            )
 
-        logger.info(
-            "Reject command '%s': resolved %d thread(s) on PR %s/%s#%d",
-            command,
-            resolved,
-            owner,
-            repo,
-            number,
-        )
-
-        # Record feedback for learning
-        try:
-            store = _open_store(owner, repo)
+        # Record feedback for learning — only from the verified bot original
+        # (parsed metadata, root coordinates, PR author). An untrusted root
+        # records nothing rather than a bogus empty-metadata event.
+        if context is not None:
             try:
-                store.record_feedback(
-                    pr_number=number,
-                    pr_url=f"https://github.com/{owner}/{repo}/pull/{number}",
-                    comment_path=payload["comment"].get("path", ""),
-                    comment_line=payload["comment"].get("original_line", 0)
-                    or payload["comment"].get("line", 0),
-                    comment_category="",
-                    comment_severity="",
-                    comment_title="",
-                    signal="rejected",
-                    actor=payload["comment"]["user"]["login"],
-                )
-            finally:
-                store.close()
-        except Exception as fb_err:
-            logger.debug("Failed to record feedback: %s", fb_err)
+                store = _open_store(owner, repo)
+                try:
+                    _record_rejected_feedback(
+                        store,
+                        pr_number=number,
+                        pr_url=f"https://github.com/{owner}/{repo}/pull/{number}",
+                        original_body=context.body,
+                        comment_path=context.path,
+                        comment_line=context.line,
+                        actor=actor,
+                        pr_author=(payload.get("pull_request", {}).get("user") or {}).get(
+                            "login", ""
+                        ),
+                    )
+                finally:
+                    store.close()
+            except Exception as fb_err:
+                logger.debug("Failed to record feedback: %s", fb_err)
 
     except Exception:
         logger.exception("Error handling thread reject event")

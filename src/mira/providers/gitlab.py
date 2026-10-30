@@ -162,6 +162,7 @@ class GitLabProvider(BaseProvider):
             repo=repo,
             head_sha=mr.get("sha") or "",
             platform="gitlab",
+            author=(mr.get("author") or {}).get("username", ""),
         )
 
     async def get_repo_permission(
@@ -498,6 +499,61 @@ class GitLabProvider(BaseProvider):
             for note in disc.get("notes", []):
                 if str(note.get("id")) == str(comment_node_id):
                     return str(disc["id"])
+        return None
+
+    async def get_review_reply_context(
+        self, pr_info: PRInfo, incoming_comment_id: int | str, bot_login: str | None = None
+    ) -> BotThreadRecord | None:
+        """The verified bot-authored root of the discussion the note lives in.
+
+        Scans the MR's discussions for one containing a note with
+        ``incoming_comment_id`` (a reply is always inside its thread's
+        discussion), then trusts only the discussion's first inline note —
+        the original suggestion — and only when its author is the bot's own
+        token user (or the given ``bot_login``). The reply's own body and
+        position are never used as the learning source. Any non-match —
+        unknown note, human root, unresolvable bot identity, non-inline
+        discussion — yields ``None``.
+        """
+        try:
+            discussions = await self._discussions(pr_info)
+        except Exception as exc:
+            logger.warning(
+                "Failed to fetch MR discussions for reply context on %s: %s", pr_info.url, exc
+            )
+            return None
+        target = str(incoming_comment_id)
+        bot_identities = {n for n in (await self._self_username(), bot_login) if n}
+        if not bot_identities:
+            logger.warning(
+                "Cannot verify bot identity for reply context on %s; refusing to trust a root",
+                pr_info.url,
+            )
+            return None
+        for disc in discussions:
+            notes = disc.get("notes") or []
+            if not any(str(n.get("id")) == target for n in notes):
+                continue
+            root = self._first_inline_note(disc)
+            if root is None:
+                return None
+            author = (root.get("author") or {}).get("username", "")
+            if author not in bot_identities:
+                logger.info(
+                    "Reply %s on MR %s answers a non-bot discussion root (author %r)",
+                    target,
+                    pr_info.url,
+                    author,
+                )
+                return None
+            pos = root.get("position") or {}
+            return BotThreadRecord(
+                thread_id=str(disc["id"]),
+                path=pos.get("new_path") or pos.get("old_path") or "",
+                line=int(pos.get("new_line") or pos.get("old_line") or 0),
+                body=root.get("body") or "",
+                is_resolved=bool(root.get("resolved")),
+            )
         return None
 
     async def get_human_review_comments(
