@@ -6,7 +6,7 @@ Forgejo has no Checks API; check runs are adapted onto commit statuses.
 from __future__ import annotations
 
 import json
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
@@ -455,3 +455,36 @@ class TestRemoveLabel:
 
         assert requests == []
         assert isinstance(error, ProviderError)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("position_field", ["position", "original_position"])
+@pytest.mark.parametrize("author", ["mira-bot", "alice"])
+async def test_learning_comments_preserve_forgejo_positions(position_field, author):
+    provider = ForgejoProvider("tok")
+    pr_info = TestCheckRuns()._pr_info()
+    review = {"id": 5, "user": {"username": author}}
+    comment = {
+        "id": 9,
+        "user": {"username": author},
+        "body": "Review finding",
+        "path": "src/auth.py",
+        position_field: 42,
+    }
+
+    async def iter_comments(pr):
+        assert pr is pr_info
+        yield review, comment
+
+    with (
+        patch.object(provider, "_self_username", new=AsyncMock(return_value="mira-bot")),
+        patch.object(provider, "_iter_review_comments", new=iter_comments),
+    ):
+        if author == "mira-bot":
+            records = await provider.get_all_bot_threads(pr_info, "mira-bot")
+        else:
+            records = await provider.get_human_review_comments(pr_info, "mira-bot")
+
+    assert len(records) == 1
+    assert records[0].path == "src/auth.py"
+    assert records[0].line == 42

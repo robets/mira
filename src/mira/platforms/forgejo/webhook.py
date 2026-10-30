@@ -173,6 +173,41 @@ async def handle_forgejo_pr(payload: dict[str, Any], auth: PlatformAuth, bot_nam
         )
 
 
+async def handle_forgejo_merge(payload: dict[str, Any], auth: PlatformAuth, bot_name: str) -> None:
+    """Collect feedback and synthesize rules after a Forgejo PR merges."""
+    from mira.platforms.handlers import run_pr_merged_learning
+
+    pr = payload.get("pull_request") or {}
+    if pr.get("merged") is not True:
+        return
+    repo = payload.get("repository") or {}
+    number = pr.get("number")
+
+    try:
+        owner, repo_name = _split_repo_path(repo.get("full_name", ""))
+    except ValueError:
+        return
+
+    pr_url = pr.get("html_url") or f"{repo.get('html_url', '')}/pulls/{number}"
+    merged_by_user = pr.get("merged_by") or {}
+    sender = payload.get("sender") or {}
+    merged_by = (
+        merged_by_user.get("login")
+        or merged_by_user.get("username")
+        or sender.get("login")
+        or sender.get("username")
+        or ""
+    )
+
+    try:
+        token = await auth.get_token()
+        provider = create_provider("forgejo", token)
+        pr_info = await provider.get_pr_info(pr_url)
+        await run_pr_merged_learning(provider, pr_info, bot_name, merged_by, platform="forgejo")
+    except Exception:
+        logger.exception("Error handling Forgejo merge for %s/%s#%s", owner, repo_name, number)
+
+
 async def handle_forgejo_push(payload: dict[str, Any], auth: PlatformAuth, bot_name: str) -> None:
     """Incrementally index a push to the default branch."""
     from mira.platforms.index_handlers import _get_app_db, run_incremental_index
@@ -432,7 +467,10 @@ async def dispatch_forgejo_event(
                 return "ignored"
             background_tasks.add_task(handle_forgejo_pr, payload, auth, bot_name)
             return "processing"
-        # Ignore other PR actions (closed, edited, labeled, merged, etc.)
+        # Forgejo reports merges as closed PRs, not a separate merged action.
+        if action == "closed" and (payload.get("pull_request") or {}).get("merged") is True:
+            background_tasks.add_task(handle_forgejo_merge, payload, auth, bot_name)
+            return "processing"
         return "ignored"
 
     if event == "push":
