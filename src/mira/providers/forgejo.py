@@ -71,6 +71,69 @@ def _forgejo_web_base(api_url: str) -> str:
     )
 
 
+_RESOLUTION_MARKER_RE = re.compile(
+    r"(?:^|\n)<!-- mira:resolved original=(\d+) sha=([0-9a-fA-F]{7,64}) -->\s*\Z"
+)
+
+
+def _resolution_marker(body: str | None) -> tuple[int, str] | None:
+    """Parse the acknowledgment marker → ``(original_comment_id, checked_sha)``."""
+    match = _RESOLUTION_MARKER_RE.search(body or "")
+    if not match:
+        return None
+    return int(match.group(1)), match.group(2).lower()
+
+
+def _int_or_zero(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _user_login(user: dict[str, Any] | None) -> str:
+    user = user or {}
+    return str(user.get("login") or user.get("username") or "")
+
+
+def _comment_line(comment: dict[str, Any]) -> int:
+    """GET position is the new-side line; original_position is the old side."""
+    return _int_or_zero(comment.get("position") or comment.get("original_position"))
+
+
+def _conversation_key(review: dict[str, Any], comment: dict[str, Any]) -> tuple[Any, ...]:
+    """Match replies to their original review, file, commits, and line side/range."""
+    return (
+        review.get("id"),
+        comment.get("path") or "",
+        comment.get("commit_id") or "",
+        comment.get("original_commit_id") or "",
+        _int_or_zero(comment.get("position")),
+        _int_or_zero(comment.get("original_position")),
+        _int_or_zero(comment.get("extra_lines_count")),
+    )
+
+
+def _reply_payload(body: str, comment: dict[str, Any]) -> dict[str, Any]:
+    """Translate GET line-side fields to the corresponding POST fields."""
+    new_line = _int_or_zero(comment.get("position"))
+    old_line = _int_or_zero(comment.get("original_position"))
+    if (
+        not comment.get("path")
+        or min(new_line, old_line) < 0
+        or (new_line > 0) == (old_line > 0)
+        or _int_or_zero(comment.get("extra_lines_count")) < 0
+    ):
+        raise ProviderError("Cannot reply without an unambiguous review-comment anchor")
+    return {
+        "body": body,
+        "path": comment["path"],
+        "new_position": new_line,
+        "old_position": old_line,
+        "extra_lines_count": _int_or_zero(comment.get("extra_lines_count")),
+    }
+
+
 class ForgejoProvider(BaseProvider):
     """Forgejo code hosting provider (Gitea-compatible REST API)."""
 
@@ -113,7 +176,10 @@ class ForgejoProvider(BaseProvider):
             while next_url:
                 resp = await client.get(next_url, headers={"Authorization": f"token {self._token}"})
                 resp.raise_for_status()
-                out.extend(resp.json())
+                page = resp.json()
+                if not isinstance(page, list):
+                    raise ProviderError(f"Forgejo pagination expected a JSON list from {next_url}")
+                out.extend(page)
                 next_url = _next_link(resp.headers.get("link", ""))
         return out
 
@@ -122,11 +188,23 @@ class ForgejoProvider(BaseProvider):
         if self._username is None:
             try:
                 resp = await self._request("GET", f"{self._api}/user")
-                self._username = (resp.json() or {}).get("username", "") or ""
+                data = resp.json() or {}
+                # The token user is identified by either field depending on API shape.
+                self._username = _user_login(data)
             except Exception as exc:
                 logger.warning("Failed to resolve Forgejo bot identity: %s", exc)
                 self._username = ""
         return self._username
+
+    async def _require_write_identity(self) -> str:
+        """Require the authenticated identity before writing review replies."""
+        username = await self._self_username()
+        if not username:
+            raise ProviderError(
+                "Cannot perform Forgejo write: the authenticated bot identity is "
+                "unknown (GET /user failed). Refusing to post as an unidentified user."
+            )
+        return username
 
     # ── PR read ─────────────────────────────────────────────────────
 
@@ -475,87 +553,260 @@ class ForgejoProvider(BaseProvider):
             return ""
 
     async def reply_to_review_comment(self, pr_info: PRInfo, comment_id: int, body: str) -> None:
-        """Reply to a review comment — Forgejo doesn't support threaded replies."""
-        # Forgejo doesn't have a native threaded-reply-to-review-comment API,
-        # so we fall back to posting a plain issue comment.
-        await self.post_comment(pr_info, body)
+        """Reply at the original review anchor, never as a detached issue comment."""
+        await self._require_write_identity()
+        try:
+            pairs = [pair async for pair in self._iter_review_comments(pr_info)]
+        except Exception as e:
+            raise ProviderError(f"Failed to locate review comment {comment_id}: {e}") from e
+        for review, comment in pairs:
+            if comment.get("id") == comment_id:
+                await self._request(
+                    "POST",
+                    self._review_comments_url(pr_info, review, comment),
+                    json=_reply_payload(body, comment),
+                )
+                return
+        raise ProviderError(
+            f"Review comment {comment_id} not found on PR {pr_info.url}; "
+            "refusing to post a top-level fallback comment"
+        )
 
     # ── reviews / threads ──────────────────────────────────────────
 
     async def _fetch_review_comments(self, pr_info: PRInfo, review_id: int) -> list[dict[str, Any]]:
-        """Fetch review comments for a given review id."""
-        resp = await self._request("GET", f"{self._pr(pr_info)}/reviews/{review_id}/comments")
-        data = resp.json()
-        if isinstance(data, list):
-            return data
-        return [data]
+        """Fetch every page of comments for a given review id."""
+        return await self._paginate(f"{self._pr(pr_info)}/reviews/{review_id}/comments")
 
     async def _iter_review_comments(
         self, pr_info: PRInfo
     ) -> AsyncGenerator[tuple[dict[str, Any], dict[str, Any]], None]:
-        """Yield ``(review, comment)`` tuples for every review comment in a PR.
-
-        Handles pagination over reviews and fetching comments per review,
-        swallowing per-review fetch errors so a single bad review doesn't
-        abort the whole traversal.
-        """
-        reviews = await self._paginate(f"{self._pr(pr_info)}/reviews")
-
-        for review in reviews:
-            try:
-                comments = await self._fetch_review_comments(pr_info, review["id"])
-            except Exception:
-                continue
-
+        """Read all pages, propagating failures so hidden replies cannot cause duplicates."""
+        for review in await self._paginate(f"{self._pr(pr_info)}/reviews"):
+            comments = await self._fetch_review_comments(pr_info, review["id"])
             for comment in comments:
-                yield (review, comment)
+                yield review, comment
+
+    def _review_comments_url(
+        self, pr_info: PRInfo, review: dict[str, Any], comment: dict[str, Any]
+    ) -> str:
+        """The original review's comments endpoint — the anchor replies keep."""
+        review_id = review["id"]
+        if comment.get("pull_request_review_id", review_id) != review_id:
+            raise ProviderError("Review comment belongs to a different review")
+        return f"{self._pr(pr_info)}/reviews/{review_id}/comments"
 
     async def get_all_bot_threads(
         self, pr_info: PRInfo, bot_login: str | None = None
     ) -> list[BotThreadRecord]:
+        """Original findings, keyed by comment ID, with native or acknowledged resolutions."""
         bot_identities = {n for n in (await self._self_username(), bot_login) if n}
-        records: list[BotThreadRecord] = []
-
+        if not bot_identities:
+            logger.warning(
+                "Forgejo bot identity unknown for PR %s; treating no comment as bot-authored",
+                pr_info.url,
+            )
+            return []
         try:
-            async for review, comment in self._iter_review_comments(pr_info):
-                review_user = (review.get("user") or {}).get("username", "")
-                if bot_identities and review_user not in bot_identities:
-                    continue
-
-                comment_user = (comment.get("user") or {}).get("username", "")
-                if bot_identities and comment_user not in bot_identities:
-                    continue
-
-                line = comment.get("position") or comment.get("original_position") or 0
-                records.append(
-                    BotThreadRecord(
-                        thread_id=str(review["id"]),
-                        path=comment.get("path") or "",
-                        line=int(line),
-                        body=comment.get("body") or "",
-                        is_resolved=bool(comment.get("resolved")),
-                        is_outdated=bool(review.get("stale")),
-                    )
-                )
+            pairs = [pair async for pair in self._iter_review_comments(pr_info)]
         except Exception as e:
             raise ProviderError(f"Failed to fetch PR reviews: {e}") from e
 
-        return records
+        findings: dict[tuple[Any, ...], tuple[dict[str, Any], dict[str, Any]]] = {}
+        acks: list[tuple[tuple[Any, ...], int, int]] = []
+        bot_pairs = [
+            (review, comment)
+            for review, comment in pairs
+            if isinstance(comment.get("id"), int)
+            and _user_login(review.get("user")) in bot_identities
+            and _user_login(comment.get("user")) in bot_identities
+        ]
+        for review, comment in sorted(bot_pairs, key=lambda pair: pair[1]["id"]):
+            key = _conversation_key(review, comment)
+            marker = _resolution_marker(comment.get("body"))
+            if marker is not None:
+                acks.append((key, marker[0], comment["id"]))
+                continue
+            findings.setdefault(key, (comment, review))  # earliest = the finding
+
+        resolved_keys = {key for key, (comment, _) in findings.items() if comment.get("resolver")}
+        for key, target, ack_id in acks:
+            entry = findings.get(key)
+            # Trust only a real bot acknowledgment posted *after* the finding
+            # it targets, at the finding's exact anchor (key). Earlier or
+            # mis-anchored markers, and markers targeting a different
+            # comment, resolve nothing.
+            if entry is not None and target == entry[0]["id"] and ack_id > entry[0]["id"]:
+                resolved_keys.add(key)
+
+        return [
+            BotThreadRecord(
+                thread_id=str(comment["id"]),
+                path=comment.get("path") or "",
+                line=_comment_line(comment),
+                body=comment.get("body") or "",
+                is_resolved=key in resolved_keys,
+                is_outdated=bool(review.get("stale")),
+            )
+            for key, (comment, review) in findings.items()
+        ]
 
     async def get_unresolved_bot_threads(
         self, pr_info: PRInfo, bot_login: str | None = None
     ) -> list[UnresolvedThread]:
         threads = await self.get_all_bot_threads(pr_info, bot_login)
         return [
-            UnresolvedThread(thread_id=t.thread_id, path=t.path, line=t.line, body=t.body)
+            UnresolvedThread(
+                thread_id=t.thread_id,
+                path=t.path,
+                line=t.line,
+                body=t.body,
+                is_outdated=t.is_outdated,
+            )
             for t in threads
             if not t.is_resolved
         ]
 
     async def resolve_threads(self, pr_info: PRInfo, thread_ids: list[str]) -> int:
-        """Resolve review threads — no-op (Forgejo hasn't shipped comment resolution)."""
-        logger.debug("resolve_threads is a no-op for Forgejo (%d threads)", len(thread_ids))
-        return 0
+        """Acknowledge original finding IDs in-thread, reusing existing acknowledgments.
+
+        Forgejo has no native resolve API. The reply records the checked SHA;
+        it does not claim that commit introduced the fix. Read before posting
+        prevents sequential replays, not simultaneous writers, from duplicating replies.
+        """
+        if not thread_ids:
+            return 0
+        username = await self._require_write_identity()
+        if not pr_info.head_sha:
+            raise ProviderError(
+                f"Cannot record resolutions on PR {pr_info.url}: the PR head SHA is "
+                "unknown; refusing to acknowledge findings without a checked revision."
+            )
+        try:
+            pairs = [pair async for pair in self._iter_review_comments(pr_info)]
+        except Exception as e:
+            raise ProviderError(f"Failed to fetch review comments before resolving: {e}") from e
+
+        by_id = {
+            comment["id"]: (review, comment)
+            for review, comment in pairs
+            if isinstance(comment.get("id"), int)
+        }
+        acks = [
+            (_conversation_key(review, comment), marker[0], comment["id"])
+            for review, comment in pairs
+            if isinstance(comment.get("id"), int) and _user_login(comment.get("user")) == username
+            for marker in [_resolution_marker(comment.get("body"))]
+            if marker is not None
+        ]
+
+        sha = pr_info.head_sha.lower()
+        resolved = 0
+        for tid in dict.fromkeys(thread_ids):
+            try:
+                original_id = int(tid)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Ignoring unresolvable Forgejo thread id %r on PR %s", tid, pr_info.url
+                )
+                continue
+            entry = by_id.get(original_id)
+            if entry is None:
+                logger.warning(
+                    "Unknown Forgejo thread id %s on PR %s; not posting anything for it",
+                    tid,
+                    pr_info.url,
+                )
+                continue
+            review, comment = entry
+            if (
+                _user_login(comment.get("user")) != username
+                or _user_login(review.get("user")) != username
+            ):
+                logger.warning(
+                    "Refusing to resolve comment %s on PR %s: not authored by the bot (%r)",
+                    tid,
+                    pr_info.url,
+                    username,
+                )
+                continue
+            if comment.get("resolver"):
+                resolved += 1  # natively resolved already
+                continue
+            key = _conversation_key(review, comment)
+            if _resolution_marker(comment.get("body")) is not None or any(
+                isinstance(other.get("id"), int)
+                and other["id"] < original_id
+                and _user_login(other.get("user")) == username
+                and _resolution_marker(other.get("body")) is None
+                and _conversation_key(other_review, other) == key
+                for other_review, other in pairs
+            ):
+                logger.warning("Comment %s is not the original finding; not resolving it", tid)
+                continue
+            if any(
+                ack_key == key and target == original_id and ack_id > original_id
+                for ack_key, target, ack_id in acks
+            ):
+                logger.debug("Forgejo finding %s already acknowledged; not reposting", tid)
+                resolved += 1
+                continue
+            body = (
+                "✅ **Resolved**\n\n"
+                f"Checked at [`{sha[:8]}`]({self._repo_owner(pr_info)}/src/commit/{sha}).\n\n"
+                f"<!-- mira:resolved original={original_id} sha={sha} -->"
+            )
+            try:
+                resp = await self._request(
+                    "POST",
+                    self._review_comments_url(pr_info, review, comment),
+                    json=_reply_payload(body, comment),
+                )
+                created_id = (resp.json() or {}).get("id")
+                if not isinstance(created_id, int):
+                    logger.warning(
+                        "Resolution reply for %s on PR %s returned no comment id",
+                        tid,
+                        pr_info.url,
+                    )
+                    continue
+                # Read the created comment back before reporting success; never
+                # auto-retry the POST, which could duplicate the acknowledgment.
+                back = (
+                    await self._request(
+                        "GET",
+                        f"{self._review_comments_url(pr_info, review, comment)}/{created_id}",
+                    )
+                ).json() or {}
+                if (
+                    back.get("id") != created_id
+                    or _user_login(back.get("user")) != username
+                    or _resolution_marker(back.get("body")) != (original_id, sha)
+                    or _conversation_key(review, back) != key
+                ):
+                    logger.warning(
+                        "Resolution reply %s for finding %s failed read-back on PR %s",
+                        created_id,
+                        tid,
+                        pr_info.url,
+                    )
+                    continue
+                resolved += 1
+            except Exception as exc:
+                logger.warning(
+                    "Failed to post resolution reply for comment %s on PR %s: %s",
+                    tid,
+                    pr_info.url,
+                    exc,
+                )
+        if resolved < len(thread_ids):
+            logger.warning(
+                "Resolved %d/%d Forgejo finding(s) on PR %s",
+                resolved,
+                len(thread_ids),
+                pr_info.url,
+            )
+        return resolved
 
     async def resolve_outdated_review_threads(self, pr_info: PRInfo) -> int:
         """Resolve outdated review threads — no-op for Forgejo."""
@@ -563,15 +814,44 @@ class ForgejoProvider(BaseProvider):
         return 0
 
     async def get_thread_id_for_comment(self, comment_node_id: str, pr_info: PRInfo) -> str | None:
-        """Look up the review thread for a comment by iterating reviews' comments."""
+        """Map an exact conversation anchor to a unique preceding bot finding."""
+        username = await self._self_username()
+        if not username:
+            return None
         try:
-            async for review, comment in self._iter_review_comments(pr_info):
-                if str(comment.get("id")) == comment_node_id:
-                    return str(review["id"])
-        except Exception:
-            pass
-
-        return None
+            pairs = [pair async for pair in self._iter_review_comments(pr_info)]
+        except Exception as exc:
+            logger.warning(
+                "Failed to look up thread for comment %s on PR %s: %s",
+                comment_node_id,
+                pr_info.url,
+                exc,
+            )
+            return None
+        target = next((pair for pair in pairs if str(pair[1].get("id")) == comment_node_id), None)
+        if target is None:
+            return None
+        key = _conversation_key(*target)
+        candidates = {
+            comment["id"]
+            for review, comment in pairs
+            if isinstance(comment.get("id"), int)
+            and _user_login(review.get("user")) == username
+            and _user_login(comment.get("user")) == username
+            and comment["id"] <= target[1]["id"]
+            and _resolution_marker(comment.get("body")) is None
+            and _conversation_key(review, comment) == key
+        }
+        if len(candidates) != 1:
+            if candidates:
+                logger.warning(
+                    "Ambiguous bot findings at the anchor of comment %s on PR %s: %s",
+                    comment_node_id,
+                    pr_info.url,
+                    sorted(candidates),
+                )
+            return None
+        return str(next(iter(candidates)))
 
     async def get_review_reply_context(
         self, pr_info: PRInfo, incoming_comment_id: int | str, bot_login: str | None = None
@@ -651,6 +931,8 @@ class ForgejoProvider(BaseProvider):
                 continue
             if cid >= reply_id:
                 continue  # must be an *earlier* comment (the original, not the reply)
+            if _resolution_marker(c.get("body")) is not None:
+                continue
             if (c.get("path") or "") != (reply.get("path") or ""):
                 continue
             if reply_new:
@@ -677,7 +959,7 @@ class ForgejoProvider(BaseProvider):
             return None
         original_review, original = candidates[0]
         return BotThreadRecord(
-            thread_id=str(original_review.get("id")),
+            thread_id=str(original["id"]),
             path=original.get("path") or "",
             line=int(original.get("position") or original.get("original_position") or 0),
             body=original.get("body") or "",
@@ -689,29 +971,38 @@ class ForgejoProvider(BaseProvider):
         self, pr_info: PRInfo, bot_login: str
     ) -> list[HumanReviewComment]:
         bot_identities = {n for n in (await self._self_username(), bot_login) if n}
+        if not bot_identities:
+            logger.warning(
+                "Forgejo bot identity unknown for PR %s; not harvesting human comments "
+                "(bot-authored text could leak into learning)",
+                pr_info.url,
+            )
+            return []
         out: list[HumanReviewComment] = []
 
         try:
-            async for review, comment in self._iter_review_comments(pr_info):
-                review_user = (review.get("user") or {}).get("username", "")
-                if review_user in bot_identities:
-                    continue
-
-                comment_user = (comment.get("user") or {}).get("username", "")
-                if comment_user in bot_identities:
-                    continue
-
-                line = comment.get("position") or comment.get("original_position") or 0
-                out.append(
-                    HumanReviewComment(
-                        path=comment.get("path") or "",
-                        line=int(line),
-                        body=comment.get("body") or "",
-                        author=comment_user,
-                    )
-                )
+            pairs = [pair async for pair in self._iter_review_comments(pr_info)]
         except Exception as e:
             raise ProviderError(f"Failed to fetch reviews for human comments: {e}") from e
+
+        for review, comment in pairs:
+            review_user = _user_login(review.get("user"))
+            if review_user in bot_identities:
+                continue
+
+            comment_user = _user_login(comment.get("user"))
+            if comment_user in bot_identities:
+                continue
+
+            line = _comment_line(comment)
+            out.append(
+                HumanReviewComment(
+                    path=comment.get("path") or "",
+                    line=int(line),
+                    body=comment.get("body") or "",
+                    author=comment_user,
+                )
+            )
 
         return out
 

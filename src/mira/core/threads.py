@@ -108,7 +108,7 @@ async def resolve_verified_threads(
     for t in threads:
         if t.path not in file_contents:
             file_contents[t.path] = await provider.get_file_content(
-                pr_info, t.path, pr_info.head_branch
+                pr_info, t.path, pr_info.head_sha or pr_info.head_branch
             )
 
     threads_by_path: dict[str, list[UnresolvedThread]] = {}

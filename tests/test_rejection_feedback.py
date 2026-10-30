@@ -216,7 +216,7 @@ class TestForgejoGetReviewReplyContext:
         with _fj_api(reviews, comments):
             rec = await self._provider().get_review_reply_context(_pr_info("forgejo"), 305)
         assert rec is not None
-        assert rec.thread_id == "5"
+        assert rec.thread_id == "101"
         assert rec.path == "app.py"
         assert rec.line == 12
         assert rec.body == BOT_BODY  # the trusted original, not the reply

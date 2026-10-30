@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import AsyncMock
 
+import pytest
+
+from mira.core.threads import resolve_verified_threads
 from mira.llm.prompts.verify_fixes import (
     _extract_issue_description,
     build_verify_fixes_prompt,
     parse_verify_fixes_response,
 )
-from mira.models import UnresolvedThread
+from mira.models import PRInfo, UnresolvedThread
 
 # Realistic formatted body matching _format_comment_body output
 _FORMATTED_BODY = (
@@ -49,6 +53,40 @@ def _make_thread(
     body: str = "Hardcoded API key.",
 ) -> UnresolvedThread:
     return UnresolvedThread(thread_id=thread_id, path=path, line=line, body=body)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("head_sha", "expected_ref"),
+    [("a" * 40, "a" * 40), ("", "feature")],
+)
+async def test_fix_check_reads_captured_revision(head_sha, expected_ref):
+    pr = PRInfo(
+        title="Fix prior finding",
+        description="",
+        base_branch="main",
+        head_branch="feature",
+        head_sha=head_sha,
+        url="https://forgejo.example/acme/widgets/pulls/1",
+        number=1,
+        owner="acme",
+        repo="widgets",
+    )
+    provider = AsyncMock()
+    provider.get_unresolved_bot_threads.return_value = [_make_thread("101")]
+    provider.get_file_content.return_value = "fixed_code()\n"
+    provider.resolve_threads.return_value = 1
+    llm = AsyncMock()
+    llm.complete.return_value = json.dumps({"results": [{"id": "101", "fixed": True}]})
+
+    checked, resolved, remaining, decisions = await resolve_verified_threads(
+        provider, llm, pr, "mira", False
+    )
+
+    provider.get_file_content.assert_awaited_once_with(pr, "src/app.py", expected_ref)
+    provider.resolve_threads.assert_awaited_once_with(pr, ["101"])
+    assert (checked, resolved, remaining) == (1, 1, [])
+    assert [(decision.thread_id, decision.fixed) for decision in decisions] == [("101", True)]
 
 
 class TestExtractIssueDescription:
